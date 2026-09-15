@@ -1,0 +1,4 @@
+interface:
+  display_name: "仟上私募报告生成"
+  short_description: "仟上私募定期报告撰写、盈利分析、批注修订与多版本交付"
+  default_prompt: "使用 $private-report-builder 按原文只读原则完成私募报告撰写或批注修订，并新建文档交付。"
