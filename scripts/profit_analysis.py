@@ -4,14 +4,16 @@
 用法:
     python3 profit_analysis.py 目前客户持仓收益.xlsx [历史客户持仓收益.xlsx] [--asof 2026-06-30]
 
-输入: 客户持仓收益xlsx，需含 `_总表` 开头的sheet，列头包含
+输入: 客户持仓收益xlsx，需含 `_总表` 或以下划线开头的明细sheet，列头包含
     产品名称/客户名称/首次申/认购时间/累计本金(含费)/累计收益-扣除费用/累计收益率(扣除费用)
 输出: 打印报告所需全部盈利指标（按人口径为主，按笔口径对照）。
 
 口径（已拍板，见SKILL.md）:
-- 盈利比例按人: 同一客户名下全部持仓的累计收益合并, >0 为盈利
+- 报告默认C口径: 当前仍持仓的最终客户为分母，同名合并当前持仓与其历史赎回收益
+- 客户名称等于基金产品名称的内部层级持仓一律排除
+- A口径（全部当前+历史客户）只作明确标注的辅助结果
 - 持有时长: 该客户首次申购日 → asof
-- 累计总盈利: 在持 + 历史(如提供) 逐笔加总
+- 累计总盈利: 排除内部层级持仓后，在持 + 历史逐笔加总
 """
 import argparse
 import re
@@ -23,11 +25,14 @@ import openpyxl
 from openpyxl.utils.datetime import from_excel
 
 
-def find_sheet(wb, prefix="_总表"):
-    for s in wb.sheetnames:
-        if s.startswith(prefix):
-            return s
-    raise SystemExit(f"未找到 {prefix} 开头的sheet, 现有: {wb.sheetnames}")
+def find_sheet(wb):
+    for prefix in ("_总表", "_"):
+        for sheet in wb.sheetnames:
+            if sheet.startswith(prefix):
+                return sheet
+    if len(wb.sheetnames) == 1:
+        return wb.sheetnames[0]
+    raise SystemExit(f"未找到明细sheet, 现有: {wb.sheetnames}")
 
 
 def col_index(header, kw):
@@ -69,7 +74,7 @@ def load(path):
         prof = r[iprof]
         if r[iname] is None or not isinstance(prof, (int, float)):
             continue
-        out.append(dict(prod=str(r[ip]), name=str(r[iname]).strip(),
+        out.append(dict(prod=str(r[ip]).strip(), name=str(r[iname]).strip(),
                         buy=normalize_date(r[ibuy], wb.epoch),
                         principal=r[iprin] or 0, profit=prof))
     wb.close()
@@ -81,7 +86,30 @@ def yrs(b, asof):
 
 
 def pct(a, b):
-    return f"{a}/{b} = {a / b * 100:.1f}%" if b else "n/a"
+    return f"{a}/{b} = {a / b * 100:.2f}%" if b else "n/a"
+
+
+def aggregate(records):
+    by = defaultdict(lambda: dict(profit=0.0, principal=0.0, first=None))
+    for record in records:
+        person = by[record["name"]]
+        person["profit"] += record["profit"]
+        person["principal"] += record["principal"]
+        if record["buy"] and (person["first"] is None or record["buy"] < person["first"]):
+            person["first"] = record["buy"]
+    return by
+
+
+def profitability(by):
+    people = list(by.values())
+    positive = sum(person["profit"] > 0 for person in people)
+    return positive, len(people)
+
+
+def normalize_fund_name(value):
+    """Remove formatting and trailing subscription notes before name matching."""
+    compact = re.sub(r"\s+", "", str(value or ""))
+    return re.sub(r"(?:（[^（）]*）|\([^()]*\))+$", "", compact)
 
 
 def main():
@@ -96,26 +124,51 @@ def main():
     cur = load(args.current)
     his = load(args.historical) if args.historical else []
 
-    print(f"数据截止: {asof}  在持{len(cur)}笔  历史{len(his)}笔\n")
+    product_names = {normalize_fund_name(record["prod"]) for record in cur + his}
+    internal_names = sorted({
+        record["name"] for record in cur + his
+        if normalize_fund_name(record["name"]) in product_names
+    })
+    cur_external = [record for record in cur if record["name"] not in internal_names]
+    his_external = [record for record in his if record["name"] not in internal_names]
+    current_names = {record["name"] for record in cur_external}
+
+    # C口径：当前持仓客户为总体，并入这些客户的历史赎回收益。
+    c_records = cur_external + [record for record in his_external if record["name"] in current_names]
+    by = aggregate(c_records)
+    current_only = aggregate(cur_external)
+    all_customers = aggregate(cur_external + his_external)
+
+    print(f"数据截止: {asof}  在持{len(cur)}笔  历史{len(his)}笔")
+    if not args.historical:
+        print("提示: 未提供历史持仓文件，C口径暂退化为只算当前持仓记录")
+    if internal_names:
+        print(f"排除内部层级持仓客户名 {len(internal_names)} 个: {internal_names}")
+    print()
 
     # ── 累计总盈利（全口径）
-    tc, th = sum(x["profit"] for x in cur), sum(x["profit"] for x in his)
+    tc = sum(record["profit"] for record in cur_external)
+    th = sum(record["profit"] for record in his_external)
     print(f"◆ 累计总盈利(在持+历史全口径): {(tc + th) / 1e8:.4f}亿  (在持{tc / 1e8:.4f}亿 + 历史{th / 1e8:.4f}亿)")
 
-    # ── 按人合并（在持）
-    by = defaultdict(lambda: dict(profit=0.0, principal=0.0, first=None))
-    for x in cur:
-        p = by[x["name"]]
-        p["profit"] += x["profit"]; p["principal"] += x["principal"]
-        if x["buy"] and (p["first"] is None or x["buy"] < p["first"]):
-            p["first"] = x["buy"]
+    # ── 按人合并的三种口径
     people = list(by.values())
     n = len(people)
     pos = [p for p in people if p["profit"] > 0]
     neg = [p for p in people if p["profit"] <= 0]
-    print(f"\n◆ 在持按人口径: 投资者{n}人, 盈利 {pct(len(pos), n)}")
-    kb = sum(1 for x in cur if x["profit"] > 0)
-    print(f"  (对照·按笔口径: {pct(kb, len(cur))} — 报告文字写'投资者'时必须用按人口径)")
+    c_positive, c_total = profitability(by)
+    current_positive, current_total = profitability(current_only)
+    all_positive, all_total = profitability(all_customers)
+    print(f"\n◆ C口径·当前持仓最终客户（并入其历史赎回收益）: 盈利 {pct(c_positive, c_total)}")
+    print(f"  对照·只算当前持仓记录: 盈利 {pct(current_positive, current_total)}")
+    if (c_positive, c_total) == (current_positive, current_total):
+        print("  历史赎回收益未改变本期任何客户的盈亏归类")
+    else:
+        print(f"  并入历史收益后，盈利人数变化 {c_positive - current_positive:+d} 人")
+    if his:
+        print(f"◆ A口径·全部当前及历史客户: 盈利 {pct(all_positive, all_total)}")
+    kb = sum(1 for record in cur_external if record["profit"] > 0)
+    print(f"  对照·当前外部客户按笔口径: {pct(kb, len(cur_external))}（不能写成投资者盈利比例）")
 
     # ── 持有时长分组
     print("\n◆ 按持有时长(首笔申购日起算):")
@@ -144,7 +197,7 @@ def main():
     if neg:
         rts = [p["profit"] / p["principal"] for p in neg if p["principal"] > 0]
         prods = defaultdict(int)
-        for x in cur:
+        for x in cur_external:
             if by[x["name"]]["profit"] <= 0:
                 prods[x["prod"][:14]] += 1
         print(f"\n◆ 浮亏画像: {len(neg)}人 (占比{len(neg) / n * 100:.1f}%)")
@@ -158,7 +211,7 @@ def main():
     # ── 分产品(按笔, 单产品内=按人)
     print("\n◆ 分产品(在持):")
     pp = defaultdict(lambda: defaultdict(float))
-    for x in cur:
+    for x in cur_external:
         pp[x["prod"]][x["name"]] += x["profit"]
     for prod, by_name in sorted(pp.items(), key=lambda kv: -len(kv[1])):
         vals = list(by_name.values())
